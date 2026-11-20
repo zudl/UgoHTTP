@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+root=$(CDPATH= cd -- "$here/../.." && pwd)
+. "$here/platform"
+key=$("$here/image-key")
+output="$root/out/container"
+mkdir -p "$output"
+docker info --format '{{.ServerVersion}}' >/dev/null
+if [ -f "$output/$key.iid" ] && docker image inspect "$(cat "$output/$key.iid")" >/dev/null 2>&1; then
+    exit 0
+fi
+build_dir=$(mktemp -d "$output/build.XXXXXXXX")
+trap 'rm -rf "$build_dir"' EXIT HUP INT TERM
+"$root/scripts/python" - "$here" "$build_dir" "$lock" <<'PYTHON'
+from pathlib import Path
+import shutil
+import sys
+from urllib.parse import unquote, urlsplit
+
+here, context = map(Path, sys.argv[1:3])
+sys.path.insert(0, str(here.parents[1] / 'native/deps'))
+import driver
+
+packages = context / 'packages'
+packages.mkdir()
+for line in (here / sys.argv[3]).read_text().splitlines():
+    sha, url = line.split()
+    deb = driver.fetch(url, sha, driver.CACHE.parent / 'deb', sha + '.deb', 'Debian package ' + url)
+    shutil.copyfile(deb, packages / unquote(urlsplit(url).path.rsplit('/', 1)[1]))
+for name in ('Dockerfile', 'fault', 'selftest.py'):
+    shutil.copyfile(here / name, context / name)
+PYTHON
+. "$root/scripts/versions.env"
+eval "base_image=\$$base_pin"
+MSYS_NO_PATHCONV=1 docker build --build-arg BASE_IMAGE="$base_image" --platform "$platform" \
+    --iidfile "$(host_path "$build_dir")/image.iid" "$(host_path "$build_dir")"
+mv "$build_dir/image.iid" "$output/$key.iid"

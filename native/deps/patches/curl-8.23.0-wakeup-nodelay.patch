@@ -1,0 +1,53 @@
+From: UgoHTTP <noreply@ugohttp.invalid>
+Subject: [PATCH] socketpair: disable Nagle on the TCP wakeup pair
+
+Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+SPDX-License-Identifier: curl
+
+Targets curl 8.23.0 (lib/socketpair.c).
+
+Defect: without eventfd, pipe and socketpair, curl_multi_wakeup() writes
+one byte to a TCP connection over loopback (wakeup_inet). Nagle holds a
+write back while an earlier one is unacknowledged, and the receiving
+stack acknowledges late (delayed ACK), so a wakeup that follows another
+one reaches curl_multi_poll() about 100 ms later. Repro on Nintendo
+Switch: abort a transfer that stalls after its headers; the abort is
+delivered about 95 ms later instead of within a millisecond.
+
+Fix: set TCP_NODELAY on socks[1], the end Curl_wakeup_signal() writes to,
+once the pair is verified.
+
+Caught by: no test in this repository: Linux, Android and Apple wake with
+eventfd or a pipe, and Windows loopback acknowledges at once. Seen on
+Nintendo Switch, where an abort took 95 ms and takes about 1 ms patched.
+
+Drop: when curl sets TCP_NODELAY on its wakeup pair itself.
+---
+--- a/lib/socketpair.c
++++ b/lib/socketpair.c
+@@ -148,6 +148,9 @@
+ #ifdef HAVE_ARPA_INET_H
+ #include <arpa/inet.h>
+ #endif
++#ifdef HAVE_NETINET_TCP_H
++#include <netinet/tcp.h>
++#endif
+ 
+ #ifndef INADDR_LOOPBACK
+ #define INADDR_LOOPBACK 0x7f000001
+@@ -267,6 +270,15 @@
+     } while(1);
+   }
+ 
++#ifdef TCP_NODELAY
++  {
++    /* Every wakeup is a one-byte write: with Nagle, a second one waits for
++       the peer's delayed ACK of the first. */
++    int nodelay = 1;
++    (void)setsockopt(socks[1], IPPROTO_TCP, TCP_NODELAY, (void *)&nodelay,
++                     (curl_socklen_t)sizeof(nodelay));
++  }
++#endif
+   if(nonblocking)
+     if(curlx_nonblock(socks[0], TRUE) < 0 ||
+        curlx_nonblock(socks[1], TRUE) < 0)

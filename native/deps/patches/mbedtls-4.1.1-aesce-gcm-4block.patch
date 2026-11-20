@@ -1,0 +1,268 @@
+From: UgoHTTP <noreply@ugohttp.invalid>
+Subject: [PATCH] gcm: four-block AESCE path for whole GCM blocks
+
+Copyright The Mbed TLS Contributors
+SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+
+Targets mbedTLS 4.1.1 / TF-PSA-Crypto 1.1.1
+(tf-psa-crypto/drivers/builtin/src/aesce.c, aesce.h, gcm.c).
+
+Defect: on AArch64 with the crypto extensions, mbedtls_gcm_update()
+runs one 16-byte block per iteration: one AES call, then one GHASH
+multiply and reduction. Each AESE chain waits for the previous one, so
+a core stays far below what its AES and PMULL units allow. Repro:
+one-shot psa_aead_decrypt of 16 KiB AES-128-GCM records in place, NDK
+r29 at -Os, on a Xiaomi 24129PN74G or a Pixel 7a: about 1040 and
+850-890 MiB/s stock, 4864 and 3451 MiB/s with this patch.
+
+Fix: the whole-block loop of mbedtls_gcm_update() hands every run of 64
+bytes to mbedtls_aesce_gcm_update_4blocks(): four counters with
+interleaved AES rounds, and the four GHASH products summed before one
+reduction, using H^2..H^4 computed at setkey. The powers live in rows of
+ctx->H that the AESCE multiply never reads, so mbedtls_gcm_context keeps
+its layout. Compiled only with MBEDTLS_BLOCK_CIPHER_C and no PSA
+block-cipher driver; taken only when GCM acceleration is AESCE (runtime
+detection unchanged: getauxval on Linux and Android, assumed elsewhere)
+and the block cipher is AES. AAD, partial blocks, the last 0-3 whole
+blocks, the tag, other ciphers, other CPUs and AArch32 keep the stock
+code. No SHA3/EOR3 instructions.
+
+Derived from TF-PSA-Crypto PR #702 (mbedtls_aesce_gcm_update_blocks,
+head 38b7b0394ab88473c56269959a126f29eb77e433, unmerged), cut down to
+that loop, without the PR's AES key-layout, helper and cipher-check
+changes.
+
+Tests: native test aes_gcm_known_answers (native/tests/test_ugo.c):
+SP 800-38D vectors and fixed outputs of the stock code for lengths
+around the 64-byte boundary, AES-128 and AES-256, in place.
+
+Drop when: the pinned TF-PSA-Crypto carries a multi-block AESCE GCM
+path (PR #702 or a successor); remove on that bump.
+
+diff --git a/tf-psa-crypto/drivers/builtin/src/aesce.c b/tf-psa-crypto/drivers/builtin/src/aesce.c
+--- a/tf-psa-crypto/drivers/builtin/src/aesce.c
++++ b/tf-psa-crypto/drivers/builtin/src/aesce.c
+@@ -608,6 +608,121 @@ void mbedtls_aesce_gcm_mult(unsigned char c[16],
+     vst1q_u8(&c[0], vc);
+ }
+ 
++#if defined(MBEDTLS_ARCH_IS_ARM64)
++
++static inline uint8x16_t gf_mult(uint8x16_t a, uint8x16_t b)
++{
++    return poly_mult_reduce(poly_mult_128(a, b));
++}
++
++/* Powers are kept bit-reflected (vrbitq_u8), the domain pmull works in. */
++void mbedtls_aesce_gcm_h_powers(unsigned char h_powers[64],
++                                const unsigned char h[16])
++{
++    uint8x16_t h1 = vrbitq_u8(vld1q_u8(h));
++    uint8x16_t h2 = gf_mult(h1, h1);
++    vst1q_u8(&h_powers[0], gf_mult(h2, h2));
++    vst1q_u8(&h_powers[16], gf_mult(h2, h1));
++    vst1q_u8(&h_powers[32], h2);
++    vst1q_u8(&h_powers[48], h1);
++}
++
++static inline uint8x16_t ctr_next(uint8x16_t ctr_ne, uint32x4_t one)
++{
++    return vreinterpretq_u8_u32(vaddq_u32(vreinterpretq_u32_u8(ctr_ne), one));
++}
++
++/* Converts the counter between its big-endian wire form and native 32-bit lanes. */
++static inline uint8x16_t ctr_swap(uint8x16_t ctr)
++{
++    return MBEDTLS_IS_BIG_ENDIAN ? ctr : vrev32q_u8(ctr);
++}
++
++MBEDTLS_OPTIMIZE_FOR_PERFORMANCE
++void mbedtls_aesce_gcm_update_4blocks(const mbedtls_aes_context *aes,
++                                      const unsigned char h_powers[64],
++                                      int encrypt,
++                                      unsigned char y[16],
++                                      unsigned char buf[16],
++                                      const unsigned char *input,
++                                      unsigned char *output,
++                                      size_t len)
++{
++    const unsigned char *rk = (const unsigned char *) (aes->buf + aes->rk_offset);
++    const int nr = aes->nr;
++    const uint8x16_t h4 = vld1q_u8(&h_powers[0]);
++    const uint8x16_t h3 = vld1q_u8(&h_powers[16]);
++    const uint8x16_t h2 = vld1q_u8(&h_powers[32]);
++    const uint8x16_t h1 = vld1q_u8(&h_powers[48]);
++    /* GCM increments only the last 32-bit word of the counter, modulo 2^32. */
++    const uint32x4_t one = vsetq_lane_u32(1, vdupq_n_u32(0), 3);
++    uint8x16_t ctr = ctr_swap(vld1q_u8(y));
++    uint8x16_t tag = vrbitq_u8(vld1q_u8(buf));
++
++    for (; len >= 64; len -= 64, input += 64, output += 64) {
++        uint8x16_t e0, e1, e2, e3, k;
++        e0 = ctr_next(ctr, one);
++        e1 = ctr_next(e0, one);
++        e2 = ctr_next(e1, one);
++        e3 = ctr_next(e2, one);
++        ctr = e3;
++        e0 = ctr_swap(e0);
++        e1 = ctr_swap(e1);
++        e2 = ctr_swap(e2);
++        e3 = ctr_swap(e3);
++
++        const unsigned char *kp = rk;
++        for (int round = 1; round < nr; round++, kp += 16) {
++            k = vld1q_u8(kp);
++            e0 = vaesmcq_u8(vaeseq_u8(e0, k));
++            e1 = vaesmcq_u8(vaeseq_u8(e1, k));
++            e2 = vaesmcq_u8(vaeseq_u8(e2, k));
++            e3 = vaesmcq_u8(vaeseq_u8(e3, k));
++        }
++        k = vld1q_u8(kp);
++        e0 = vaeseq_u8(e0, k);
++        e1 = vaeseq_u8(e1, k);
++        e2 = vaeseq_u8(e2, k);
++        e3 = vaeseq_u8(e3, k);
++        k = vld1q_u8(kp + 16);
++        e0 = veorq_u8(e0, k);
++        e1 = veorq_u8(e1, k);
++        e2 = veorq_u8(e2, k);
++        e3 = veorq_u8(e3, k);
++
++        /* All four inputs are read before any output is written: the caller
++         * may pass output == input or output below input. */
++        const uint8x16_t in0 = vld1q_u8(&input[0]);
++        const uint8x16_t in1 = vld1q_u8(&input[16]);
++        const uint8x16_t in2 = vld1q_u8(&input[32]);
++        const uint8x16_t in3 = vld1q_u8(&input[48]);
++        const uint8x16_t out0 = veorq_u8(in0, e0);
++        const uint8x16_t out1 = veorq_u8(in1, e1);
++        const uint8x16_t out2 = veorq_u8(in2, e2);
++        const uint8x16_t out3 = veorq_u8(in3, e3);
++        vst1q_u8(&output[0], out0);
++        vst1q_u8(&output[16], out1);
++        vst1q_u8(&output[32], out2);
++        vst1q_u8(&output[48], out3);
++
++        /* ((tag ^ c0) * H^4) ^ (c1 * H^3) ^ (c2 * H^2) ^ (c3 * H), reduced once. */
++        uint8x16x3_t p0 = poly_mult_128(veorq_u8(tag, vrbitq_u8(encrypt ? out0 : in0)), h4);
++        uint8x16x3_t p1 = poly_mult_128(vrbitq_u8(encrypt ? out1 : in1), h3);
++        uint8x16x3_t p2 = poly_mult_128(vrbitq_u8(encrypt ? out2 : in2), h2);
++        uint8x16x3_t p3 = poly_mult_128(vrbitq_u8(encrypt ? out3 : in3), h1);
++        /* Unrolled by hand: at -Os a loop over val[] spills all four products to the stack. */
++        p0.val[0] = veorq_u8(veorq_u8(p0.val[0], p1.val[0]), veorq_u8(p2.val[0], p3.val[0]));
++        p0.val[1] = veorq_u8(veorq_u8(p0.val[1], p1.val[1]), veorq_u8(p2.val[1], p3.val[1]));
++        p0.val[2] = veorq_u8(veorq_u8(p0.val[2], p1.val[2]), veorq_u8(p2.val[2], p3.val[2]));
++        tag = poly_mult_reduce(p0);
++    }
++
++    vst1q_u8(y, ctr_swap(ctr));
++    vst1q_u8(buf, vrbitq_u8(tag));
++}
++
++#endif /* MBEDTLS_ARCH_IS_ARM64 */
++
+ #endif /* MBEDTLS_GCM_C */
+ 
+ #if defined(MBEDTLS_POP_TARGET_PRAGMA)
+diff --git a/tf-psa-crypto/drivers/builtin/src/aesce.h b/tf-psa-crypto/drivers/builtin/src/aesce.h
+--- a/tf-psa-crypto/drivers/builtin/src/aesce.h
++++ b/tf-psa-crypto/drivers/builtin/src/aesce.h
+@@ -91,6 +91,33 @@ void mbedtls_aesce_gcm_mult(unsigned char c[16],
+                             const unsigned char a[16],
+                             const unsigned char b[16]);
+ 
++#if defined(MBEDTLS_ARCH_IS_ARM64)
++/**
++ * \brief          Internal: H^4, H^3, H^2, H for mbedtls_aesce_gcm_update_4blocks().
++ */
++void mbedtls_aesce_gcm_h_powers(unsigned char h_powers[64],
++                                const unsigned char h[16]);
++
++/**
++ * \brief          Internal: AES-GCM over whole blocks, four at a time.
++ *
++ * \param aes      AES context keyed for encryption while AESCE is supported
++ * \param encrypt  1 to encrypt, 0 to decrypt
++ * \param y        GCM counter block, advanced by \p len / 16
++ * \param buf      GHASH state; must not hold a pending partial block
++ * \param output   May equal \p input or start before it
++ * \param len      A multiple of 64
++ */
++void mbedtls_aesce_gcm_update_4blocks(const mbedtls_aes_context *aes,
++                                      const unsigned char h_powers[64],
++                                      int encrypt,
++                                      unsigned char y[16],
++                                      unsigned char buf[16],
++                                      const unsigned char *input,
++                                      unsigned char *output,
++                                      size_t len);
++#endif /* MBEDTLS_ARCH_IS_ARM64 */
++
+ 
+ #if !defined(MBEDTLS_BLOCK_CIPHER_NO_DECRYPT)
+ /**
+diff --git a/tf-psa-crypto/drivers/builtin/src/gcm.c b/tf-psa-crypto/drivers/builtin/src/gcm.c
+--- a/tf-psa-crypto/drivers/builtin/src/gcm.c
++++ b/tf-psa-crypto/drivers/builtin/src/gcm.c
+@@ -45,6 +45,13 @@
+ #define MBEDTLS_GCM_ACC_AESNI       2
+ #define MBEDTLS_GCM_ACC_AESCE       3
+ 
++#if defined(MBEDTLS_AESCE_HAVE_CODE) && defined(MBEDTLS_ARCH_IS_ARM64) && defined(MBEDTLS_AES_C) && \
++    defined(MBEDTLS_BLOCK_CIPHER_C) && !defined(MBEDTLS_BLOCK_CIPHER_SOME_PSA)
++#define GCM_AESCE_4BLOCKS
++/* Rows of ctx->H that only the table-based multiplications use. */
++#define GCM_AESCE_H_POWERS(ctx) ((unsigned char *) (ctx)->H[0])
++#endif
++
+ /*
+  * Initialize a context
+  */
+@@ -124,6 +131,9 @@ static int gcm_gen_table(mbedtls_gcm_context *ctx)
+ 
+ #if defined(MBEDTLS_AESCE_HAVE_CODE)
+         case MBEDTLS_GCM_ACC_AESCE:
++#if defined(GCM_AESCE_4BLOCKS)
++            mbedtls_aesce_gcm_h_powers(GCM_AESCE_H_POWERS(ctx), h);
++#endif
+             return 0;
+ #endif
+ 
+@@ -519,6 +529,17 @@ int mbedtls_gcm_update_ad(mbedtls_gcm_context *ctx,
+     return 0;
+ }
+ 
++#if defined(GCM_AESCE_4BLOCKS)
++static const mbedtls_aes_context *gcm_aesce_aes_ctx(const mbedtls_gcm_context *ctx)
++{
++    if (ctx->acceleration == MBEDTLS_GCM_ACC_AESCE &&
++        ctx->block_cipher_ctx.id == MBEDTLS_BLOCK_CIPHER_ID_AES) {
++        return &ctx->block_cipher_ctx.ctx.aes;
++    }
++    return NULL;
++}
++#endif
++
+ /* Increment the counter. */
+ static void gcm_incr(unsigned char y[16])
+ {
+@@ -621,6 +642,19 @@ int mbedtls_gcm_update(mbedtls_gcm_context *ctx,
+ 
+     ctx->len += input_length;
+ 
++#if defined(GCM_AESCE_4BLOCKS)
++    const mbedtls_aes_context *aes = gcm_aesce_aes_ctx(ctx);
++    if (aes != NULL && input_length >= 64) {
++        size_t len = input_length & ~(size_t) 63;
++        mbedtls_aesce_gcm_update_4blocks(aes, GCM_AESCE_H_POWERS(ctx),
++                                         ctx->mode == MBEDTLS_GCM_ENCRYPT,
++                                         ctx->y, ctx->buf, p, out_p, len);
++        input_length -= len;
++        p += len;
++        out_p += len;
++    }
++#endif
++
+     while (input_length >= 16) {
+         gcm_incr(ctx->y);
+         if ((ret = gcm_mask(ctx, ectr, 0, 16, p, out_p)) != 0) {

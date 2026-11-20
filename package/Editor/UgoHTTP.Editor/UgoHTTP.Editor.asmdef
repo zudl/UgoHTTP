@@ -1,0 +1,6 @@
+{
+  "name": "UgoHttp.Editor",
+  "rootNamespace": "UgoHttp.Editor",
+  "references": ["UgoHttp"],
+  "includePlatforms": ["Editor"]
+}

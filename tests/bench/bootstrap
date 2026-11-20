@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")"
+export UV_CACHE_DIR="$(cd ../.. && pwd)/tmp/uv-cache"
+export UV_PROJECT_ENVIRONMENT="$(pwd)/.venv"
+minimum=$(sed -n 's/^PYTHON_MIN_VERSION=//p' ../../scripts/versions.env)
+python=$(../../scripts/python -c 'import sys; print(sys.executable)')
+expected=$("$python" -c 'import platform; print(platform.python_version())')
+"$python" -c 'import sys; sys.exit(sys.version_info < tuple(map(int, sys.argv[1].split("."))))' "$minimum" ||
+    { echo "Python: expected $minimum or newer, got $expected" >&2; exit 1; }
+uv sync --locked --no-dev --python "$python"
+venv=.venv/bin/python
+[ -x "$venv" ] || venv=.venv/Scripts/python.exe
+actual=$("$venv" -c 'import platform; print(platform.python_version())')
+[ "$actual" = "$expected" ] || { echo "venv Python: expected $expected, got $actual" >&2; exit 1; }
+printf 'venv Python %s (%s)\n' "$actual" "$("$venv" -c 'import sys; print(sys.executable)')"

@@ -1,0 +1,5 @@
+{
+  "name": "UgoHttp.Unity",
+  "rootNamespace": "UgoHttp.Unity",
+  "references": ["UgoHttp"]
+}

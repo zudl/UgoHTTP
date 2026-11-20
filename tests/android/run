@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import difflib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+import zipfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from player_common import PINS, ROOT, Failed, Lines, Unavailable, check_posts, log, run, start_bench, stop_process
+
+SDK = Path(os.environ.get('UGOHTTP_AVD_SDK', PINS['ANDROID_AVD_SDK_ROOT']))
+ADB = '/opt/homebrew/bin/adb'
+EMULATOR = SDK / 'emulator/emulator'
+AVDMANAGER = SDK / 'cmdline-tools/latest/bin/avdmanager'
+IMAGE = PINS['ANDROID_AVD_IMAGE']
+AVD = 'ugohttp_player'
+PACKAGE = 'com.ugohttp.player'
+ACTIVITY = 'com.unity3d.player.UnityPlayerActivity'
+BOOT_TIMEOUT_S = 300
+RESULT_TIMEOUT_S = 180
+os.environ['ANDROID_SDK_ROOT'] = str(SDK)
+os.environ.setdefault('JAVA_HOME', '/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home')
+
+
+def adb(serial, *args, **kwargs):
+    return run([ADB, '-s', serial, *args], **kwargs)
+
+
+def require_tools():
+    image = SDK / IMAGE.replace(';', '/') / 'system.img'
+    for path in (Path(ADB), EMULATOR, AVDMANAGER, image, Path(os.environ['JAVA_HOME']) / 'bin/java',
+                 ROOT / 'tests/bench/.venv/bin/python'):
+        if not path.exists():
+            raise Unavailable(f'{path} is missing; run ./scripts/bootstrap')
+
+
+def ensure_avd():
+    try:
+        if (Path.home() / f'.android/avd/{AVD}.avd/config.ini').is_file():
+            return
+        subprocess.run([str(AVDMANAGER), 'create', 'avd', '-n', AVD, '-k', IMAGE, '-d', 'pixel_6'],
+                       input='no\n', text=True, check=True, stdout=sys.stderr, stderr=sys.stderr)
+    except (Failed, OSError, subprocess.SubprocessError) as error:
+        raise Unavailable(f'avdmanager create failed: {error}') from error
+
+
+def devices():
+    return [line.split()[0] for line in run([ADB, 'devices']).splitlines()[1:] if line.strip()]
+
+
+def running_avd(serial):
+    return run([ADB, '-s', serial, 'emu', 'avd', 'name'], check=False).splitlines()[0:1] == [AVD]
+
+
+def busy_ports():
+    output = subprocess.run(['lsof', '-nP', '-iTCP', '-sTCP:LISTEN'], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+    ports = {int(field.rsplit(':', 1)[1]) for line in output.splitlines()[1:]
+             for field in line.split()[8:9] if field.rsplit(':', 1)[-1].isdigit()}
+    for line in run([ADB, 'forward', '--list']).splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[1].startswith('tcp:'):
+            ports.add(int(parts[1][4:]))
+    return ports
+
+
+def boot(work):
+    try:
+        taken = devices()
+        for serial in taken:
+            if serial.startswith('emulator-') and running_avd(serial):
+                raise Unavailable(f'{AVD} already runs as {serial}')
+        busy = busy_ports()
+        for slot in range(16):
+            console = 5554 + 2 * slot
+            if f'emulator-{console}' in taken or busy & {console, console + 1, 7777 + 2 * slot, 7778 + 2 * slot}:
+                continue
+            serial = f'emulator-{console}'
+            started = time.monotonic()
+            log_path = work / f'emulator-{console}.log'
+            with log_path.open('w') as output:
+                process = subprocess.Popen([str(EMULATOR), '-avd', AVD, '-port', str(console), '-no-audio',
+                                            '-gpu', 'host', '-feature', '-Vulkan', '-memory', '4096', '-no-boot-anim'],
+                                           stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                while process.poll() is None:
+                    if time.monotonic() - started > BOOT_TIMEOUT_S:
+                        raise Unavailable(f'{serial} did not boot in {BOOT_TIMEOUT_S}s; see {log_path}')
+                    try:
+                        state = subprocess.run([ADB, '-s', serial, 'shell', 'getprop', 'sys.boot_completed'],
+                                               text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+                    except subprocess.TimeoutExpired:
+                        continue
+                    if state.stdout.strip() == '1':
+                        seconds = round(time.monotonic() - started, 1)
+                        log(f'{serial} ready in {seconds}s')
+                        return serial, process, seconds
+                    time.sleep(1)
+            except BaseException:
+                stop_process(process, group=True)
+                raise
+            log(f'emulator on slot {slot} exited {process.returncode}; trying the next slot')
+        raise Unavailable('no free emulator slot')
+    except (Failed, OSError, subprocess.SubprocessError) as error:
+        raise Unavailable(f'emulator preparation failed: {error}') from error
+
+
+def stop_emulator(serial, process):
+    try:
+        subprocess.run([ADB, '-s', serial, 'emu', 'kill'], stdout=sys.stderr, stderr=sys.stderr, timeout=30)
+        process.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        stop_process(process, group=True)
+    left = subprocess.run(['pgrep', '-f', f'qemu-system.*-avd {AVD}( |$)'], text=True,
+                          stdout=subprocess.PIPE).stdout.split()
+    if left:
+        raise Failed(f'qemu of {AVD} still running: {left}')
+
+
+def release(serial, reverses, bench, emulator):
+    problems = []
+
+    def attempt(action, *args, **kwargs):
+        try:
+            action(*args, **kwargs)
+        except (Failed, OSError, subprocess.SubprocessError) as error:
+            problems.append(str(error))
+
+    if serial:
+        for port in reverses:
+            attempt(adb, serial, 'reverse', '--remove', f'tcp:{port}', check=False, timeout=30)
+        attempt(adb, serial, 'shell', 'am', 'force-stop', PACKAGE, check=False, timeout=30)
+    if bench:
+        attempt(stop_process, bench)
+    if emulator:
+        attempt(stop_emulator, serial, emulator)
+    return problems
+
+
+def read_player(serial, work, config):
+    adb(serial, 'logcat', '-c')
+    capture = (work / 'logcat.txt').open('w')
+    logcat = subprocess.Popen([ADB, '-s', serial, 'logcat', '-v', 'raw', '-s', 'Unity:I', 'DEBUG:*',
+                               'AndroidRuntime:*'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    encoded = base64.b64encode(json.dumps(config).encode()).decode()
+    try:
+        lines = Lines(logcat.stdout)
+        adb(serial, 'shell', 'am', 'start', '-W', '-n', f'{PACKAGE}/{ACTIVITY}', '--es', 'ugo', encoded)
+        layout, ended = [], False
+        deadline, alive_check = time.monotonic() + RESULT_TIMEOUT_S, time.monotonic() + 2
+        while time.monotonic() < deadline:
+            for line in lines.read(1):
+                capture.write(line + '\n')
+                if line == 'UGO-LAYOUT-END':
+                    ended = True
+                elif line.startswith('UGO-LAYOUT ') and not ended:
+                    layout.append(line[len('UGO-LAYOUT '):])
+                elif line.startswith('UGO-RESULT '):
+                    return layout, ended, json.loads(line[len('UGO-RESULT '):])
+            if lines.closed:
+                raise Failed('logcat ended before the result')
+            if time.monotonic() >= alive_check:
+                alive_check = time.monotonic() + 2
+                if not adb(serial, 'shell', 'pidof', PACKAGE, check=False).strip():
+                    raise Failed(f'{PACKAGE} died before reporting a result; see {capture.name}')
+        raise Failed(f'no UGO-RESULT within {RESULT_TIMEOUT_S}s; see {capture.name}')
+    finally:
+        logcat.terminate()
+        logcat.wait()
+        capture.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Runs the IL2CPP player checks on an emulator of its own.')
+    parser.add_argument('--apk', required=True, type=Path)
+    parser.add_argument('--work', required=True, type=Path)
+    options = parser.parse_args()
+    options.work.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    summary = {'status': 'error'}
+    serial = process = bench = None
+    reverses = []
+    try:
+        require_tools()
+        if not options.apk.is_file():
+            raise Unavailable(f'{options.apk} is missing')
+        with zipfile.ZipFile(options.apk) as apk:
+            summary.update(apk_bytes=options.apk.stat().st_size,
+                           libugo_so_bytes=apk.getinfo('lib/arm64-v8a/libugo.so').file_size)
+        native = subprocess.run([str(ROOT / 'native/abi/dump')], check=True, text=True,
+                                stdout=subprocess.PIPE).stdout.splitlines()
+        ensure_avd()
+        serial, process, summary['boot_seconds'] = boot(options.work)
+        summary['serial'] = serial
+        bench, ready = start_bench()
+        endpoints = {name: ready['endpoints'][name] for name in ('http', 'https', 'self_signed')}
+        for url in endpoints.values():
+            port = url.rsplit(':', 1)[1]
+            adb(serial, 'reverse', f'tcp:{port}', f'tcp:{port}')
+            reverses.append(port)
+        settle = time.monotonic()
+        adb(serial, 'shell', 'am', 'wait-for-broadcast-idle', timeout=300)
+        summary['settle_seconds'] = round(time.monotonic() - settle, 1)
+        adb(serial, 'install', '-r', '-g', options.apk, timeout=300)
+        adb(serial, 'shell', 'am', 'wait-for-broadcast-idle', timeout=300)
+        adb(serial, 'shell', 'am', 'force-stop', PACKAGE)
+        config = {**endpoints, 'ca_pem': Path(ready['ca_pem']).read_text()}
+        layout, ended, result = read_player(serial, options.work, config)
+        diff = list(difflib.unified_diff(native, layout, 'native.dump', 'il2cpp.dump', lineterm=''))
+        (options.work / 'layout.diff').write_text('\n'.join(diff) + '\n' if diff else '')
+        checks = result.get('checks', {})
+        check_posts(checks, ready)
+        if 'fatal' in checks:
+            checks['fatal'] = 'fail: ' + checks['fatal']
+        for name in ('detached_post', 'websocket_listener', 'websocket_awaitable_wss'):
+            checks.setdefault(name, 'fail: no result')
+        passed = (result.get('all_passed') is True and ended and not diff
+                  and all(value == 'pass' for value in checks.values()))
+        summary.update(status='pass' if passed else 'fail', checks=checks, layout_lines=len(layout),
+                       layout_diff_lines=len(diff))
+    except Unavailable as error:
+        summary.update(status='error', problems=[str(error)])
+    except (Failed, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        summary.update(status='fail', problems=[str(error)])
+    finally:
+        problems = release(serial, reverses, bench, process)
+        if problems:
+            summary.update(status='fail', problems=summary.get('problems', []) + problems)
+    summary['seconds'] = round(time.monotonic() - started, 1)
+    print(json.dumps(summary, separators=(',', ':')), flush=True)
+    return {'pass': 0, 'fail': 1}.get(summary['status'], 2)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

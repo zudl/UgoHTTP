@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+python="$root/tests/bench/.venv/bin/python"
+[ -x "$python" ] || python="$root/tests/bench/.venv/Scripts/python.exe"
+exec "$python" "$root/tests/bench/server.py" "$@"

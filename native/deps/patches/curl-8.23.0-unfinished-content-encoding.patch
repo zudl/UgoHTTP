@@ -1,0 +1,151 @@
+From: UgoHTTP <noreply@ugohttp.invalid>
+Subject: [PATCH] content_encoding: fail a gzip/deflate body that ends early
+
+Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+SPDX-License-Identifier: curl
+
+Targets curl 8.23.0 (lib/content_encoding.c, lib/content_encoding.h,
+lib/transfer.c).
+
+Defect: when a gzip or deflate stream stops before its end while the HTTP
+framing says the body is complete (Content-Length reached, last chunk,
+HTTP/2 END_STREAM), curl reports success with the decoded prefix.
+inflate() returns Z_BUF_ERROR on exhausted input, which is not an error,
+and gzip_do_close()/deflate_do_close() return void, so nothing checks
+that the stream reached Z_STREAM_END. Repro: serve gzip.compress(body)
+cut in half with a matching Content-Length; curl --compressed exits 0.
+
+Fix: Curl_xfer_write_done(), on a transfer that is not premature, walks
+the writer stack while it still exists and returns
+CURLE_BAD_CONTENT_ENCODING for any gzip/deflate writer that took body
+bytes but is not finished (ZLIB_UNINIT after Z_STREAM_END; raw deflate
+may stay in ZLIB_EXTERNAL_TRAILER). "Took body bytes" is a sticky flag
+set on the first non-empty body write, not z_stream.total_in: that is an
+unsigned long, 32-bit on LLP64 Windows and 32-bit ABIs, and wraps to 0
+after 4 GiB of input; inflateReset2() of the raw-deflate fallback also
+zeroes it. A writer that took no input (empty body with
+Content-Encoding, the ignored body of a followed redirect) passes. An
+earlier error is kept: multi_done() keeps the first fatal result.
+
+Drop when: upstream curl detects the unfinished stream itself; remove on
+the curl bump that carries it.
+
+Tested here: native test content_encoding_truncated (gzip header,
+payload and trailer cuts; zlib-wrapped and raw deflate; Content-Length,
+chunked and HTTP/2; memory and file sinks, KEEP_PARTIAL; valid empty gzip
+and HEAD as negatives), .NET GzipIsDecodedUnlessTheCallerSetsAcceptEncoding.
+---
+diff --git a/lib/content_encoding.c b/lib/content_encoding.c
+index 0feecce..f5f5d5b 100644
+--- a/lib/content_encoding.c
++++ b/lib/content_encoding.c
+@@ -80,6 +80,7 @@ typedef enum {
+ struct zlib_writer {
+   struct Curl_cwriter super;
+   zlibInitState zlib_init;   /* zlib init state */
++  BIT(body_seen);
+   char buffer[DECOMPRESS_BUFFER_SIZE]; /* Put the decompressed data here. */
+   uInt trailerlen;           /* Remaining trailer byte count. */
+   z_stream z;                /* State structure for zlib. */
+@@ -273,6 +274,7 @@ static CURLcode deflate_do_write(struct Curl_easy *data,
+ 
+   if(!(type & CLIENTWRITE_BODY) || !nbytes)
+     return Curl_cwriter_write(data, writer->next, type, buf, nbytes);
++  zp->body_seen = TRUE;
+ 
+   /* Set the compressed input when this function is called */
+   z->next_in = (z_const Bytef *)buf;
+@@ -335,6 +337,7 @@ static CURLcode gzip_do_write(struct Curl_easy *data,
+ 
+   if(!(type & CLIENTWRITE_BODY) || !nbytes)
+     return Curl_cwriter_write(data, writer->next, type, buf, nbytes);
++  zp->body_seen = TRUE;
+ 
+   if(zp->zlib_init == ZLIB_INIT_GZIP) {
+     /* Let zlib handle the gzip decompression entirely */
+@@ -368,6 +371,15 @@ static const struct Curl_cwtype gzip_encoding = {
+   sizeof(struct zlib_writer)
+ };
+ 
++static bool zlib_unfinished(const struct Curl_cwriter *writer)
++{
++  const struct zlib_writer *zp = (const struct zlib_writer *)writer;
++  if(writer->cwt != &gzip_encoding && writer->cwt != &deflate_encoding)
++    return FALSE;
++  return zp->body_seen && zp->zlib_init != ZLIB_UNINIT &&
++         zp->zlib_init != ZLIB_EXTERNAL_TRAILER;
++}
++
+ #endif /* HAVE_LIBZ */
+ 
+ #ifdef HAVE_BROTLI
+@@ -858,6 +870,22 @@ CURLcode Curl_build_unencoding_stack(struct Curl_easy *data,
+   return CURLE_OK;
+ }
+ 
++CURLcode Curl_unencode_done(struct Curl_easy *data)
++{
++#ifdef HAVE_LIBZ
++  const struct Curl_cwriter *writer;
++  for(writer = data->req.writer.stack; writer; writer = writer->next) {
++    if(zlib_unfinished(writer)) {
++      failf(data, "%s stream ended prematurely", writer->cwt->name);
++      return CURLE_BAD_CONTENT_ENCODING;
++    }
++  }
++#else
++  (void)data;
++#endif
++  return CURLE_OK;
++}
++
+ #else
+ /* Stubs for builds without HTTP. */
+ CURLcode Curl_build_unencoding_stack(struct Curl_easy *data,
+@@ -874,4 +902,10 @@ char *Curl_get_content_encodings(void)
+   return curlx_strdup(CONTENT_ENCODING_DEFAULT);
+ }
+ 
++CURLcode Curl_unencode_done(struct Curl_easy *data)
++{
++  (void)data;
++  return CURLE_OK;
++}
++
+ #endif /* CURL_DISABLE_HTTP */
+diff --git a/lib/content_encoding.h b/lib/content_encoding.h
+index e84a739..1f5ae9f 100644
+--- a/lib/content_encoding.h
++++ b/lib/content_encoding.h
+@@ -32,4 +32,6 @@ char *Curl_get_content_encodings(void);
+ 
+ CURLcode Curl_build_unencoding_stack(struct Curl_easy *data,
+                                      const char *enclist, int is_transfer);
++
++CURLcode Curl_unencode_done(struct Curl_easy *data);
+ #endif /* HEADER_CURL_CONTENT_ENCODING_H */
+diff --git a/lib/transfer.c b/lib/transfer.c
+index 3f0f215..d4c8999 100644
+--- a/lib/transfer.c
++++ b/lib/transfer.c
+@@ -72,6 +72,7 @@
+ #include "headers.h"
+ #include "bufref.h"
+ #include "rtsp.h"
++#include "content_encoding.h"
+ 
+ #if !defined(CURL_DISABLE_HTTP) || !defined(CURL_DISABLE_SMTP) || \
+   !defined(CURL_DISABLE_IMAP)
+@@ -794,8 +795,10 @@ CURLcode Curl_xfer_write_resp_hd(struct Curl_easy *data,
+ 
+ CURLcode Curl_xfer_write_done(struct Curl_easy *data, bool premature)
+ {
+-  (void)premature;
+-  return Curl_cw_out_done(data);
++  CURLcode result = Curl_cw_out_done(data);
++  if(!result && !premature)
++    result = Curl_unencode_done(data);
++  return result;
+ }
+ 
+ bool Curl_xfer_needs_flush(struct Curl_easy *data)

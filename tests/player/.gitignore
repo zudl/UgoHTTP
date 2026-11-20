@@ -1,0 +1,13 @@
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Ll]ogs/
+[Uu]serSettings/
+[Tt]est[Rr]esults/
+*.csproj
+*.sln
+*.slnx
+*.pidb
+*.booproj
+*.userprefs
+.utmp/

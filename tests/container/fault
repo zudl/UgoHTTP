@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import select
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+STATE = Path("/run/ugohttp-fault")
+
+
+def run(*args, check=True):
+    return subprocess.run(args, check=check, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def chain():
+    run("iptables", "-N", "UGO_FAULT", check=False)
+    if run("iptables", "-C", "OUTPUT", "-j", "UGO_FAULT", check=False).returncode:
+        run("iptables", "-I", "OUTPUT", "1", "-j", "UGO_FAULT")
+
+
+def query(name, port=53):
+    labels = b"".join(bytes([len(label)]) + label.encode("ascii") for label in name.split(".")) + b"\0"
+    packet = struct.pack("!6H", 1234, 0x100, 1, 0, 0, 0) + labels + struct.pack("!2H", 1, 1)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(0.2)
+        sock.sendto(packet, ("127.0.0.1", port))
+        data = sock.recv(4096)
+    return data[3] & 15
+
+
+def servfail():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        (STATE / "upstream-port").write_text(str(sock.getsockname()[1]))
+        while True:
+            packet, addr = sock.recvfrom(4096)
+            response = packet[:2] + struct.pack("!H", 0x8182) + packet[4:6] + b"\0" * 6 + packet[12:]
+            sock.sendto(response, addr)
+
+
+def dns(mode, name):
+    STATE.mkdir(parents=True, exist_ok=True)
+    if not all(label and len(label) <= 63 and all(c.isalnum() or c == "-" for c in label) for label in name.split(".")):
+        raise ValueError("invalid DNS name")
+    pidfile = STATE / "dnsmasq.pid"
+    if pidfile.exists():
+        pid = int(pidfile.read_text())
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 3
+        while Path(f"/proc/{pid}/stat").exists():
+            if Path(f"/proc/{pid}/stat").read_text().split()[2] == "Z":
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError("dnsmasq did not stop")
+            select.select([], [], [], 0.01)
+    args = ["dnsmasq", "--keep-in-foreground", "--user=root", "--no-resolv", "--no-hosts", "--bind-interfaces",
+        "--listen-address=127.0.0.1", "--cache-size=0", "--log-queries", "--log-facility=-"]
+    if mode == "nxdomain":
+        args.append(f"--address=/{name}/")
+    elif mode == "ok":
+        args.append(f"--address=/{name}/127.0.0.1")
+    else:
+        portfile = STATE / "upstream-port"
+        if not portfile.exists():
+            with (STATE / "upstream.log").open("ab") as log:
+                process = subprocess.Popen([sys.executable, __file__, "_servfail"], stdout=log, stderr=log)
+            deadline = time.monotonic() + 3
+            while not portfile.exists():
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError("SERVFAIL upstream failed to start")
+                select.select([], [], [], 0.01)
+        args.append(f"--server=/{name}/127.0.0.1#{portfile.read_text()}")
+    with (STATE / "dnsmasq.log").open("ab") as log:
+        process = subprocess.Popen(args, stdout=log, stderr=log)
+    pidfile.write_text(str(process.pid))
+    Path("/etc/resolv.conf").write_text("nameserver 127.0.0.1\noptions attempts:1 timeout:1\n")
+    deadline = time.monotonic() + 3
+    expected = {"ok": 0, "nxdomain": 3, "servfail": 2}[mode]
+    while True:
+        if process.poll() is not None:
+            raise RuntimeError((STATE / "dnsmasq.log").read_text())
+        try:
+            if query(name) == expected:
+                return
+        except TimeoutError:
+            pass
+        if time.monotonic() >= deadline:
+            raise TimeoutError("DNS readiness")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=["blackhole", "slow-connect", "dns", "offline", "online", "_servfail", "rcode"])
+    parser.add_argument("values", nargs="*")
+    args = parser.parse_args()
+    if args.action == "_servfail":
+        servfail()
+        return
+    if args.action == "rcode":
+        print(json.dumps({"name": args.values[0], "rcode": query(args.values[0])}))
+        return
+    if args.action == "dns":
+        mode, name = args.values
+        if mode not in ("nxdomain", "servfail", "ok"):
+            raise ValueError("DNS mode")
+        dns(mode, name)
+        return
+    chain()
+    if args.action == "blackhole":
+        port = int(args.values[0])
+        if not 0 < port < 65536:
+            raise ValueError("port")
+        run("iptables", "-A", "UGO_FAULT", "-p", "tcp", "--dport", str(port), "--tcp-flags", "SYN,ACK", "SYN", "-j", "DROP")
+    elif args.action == "slow-connect":
+        delay = int(args.values[0])
+        if delay < 0:
+            raise ValueError("negative delay")
+        run("tc", "qdisc", "del", "dev", "lo", "root", check=False)
+        if delay:
+            run("tc", "qdisc", "add", "dev", "lo", "root", "handle", "1:", "prio")
+            run("tc", "qdisc", "add", "dev", "lo", "parent", "1:3", "handle", "30:", "netem", "delay", f"{delay}ms")
+            run("tc", "filter", "add", "dev", "lo", "protocol", "ip", "parent", "1:", "prio", "1", "u32",
+                "match", "ip", "protocol", "6", "0xff", "match", "u8", "0x02", "0x12", "at", "33", "flowid", "1:3")
+    elif args.action == "offline":
+        run("iptables", "-A", "UGO_FAULT", "-j", "DROP")
+    elif args.action == "online":
+        run("iptables", "-F", "UGO_FAULT")
+        run("tc", "qdisc", "del", "dev", "lo", "root", check=False)
+
+
+if __name__ == "__main__":
+    main()

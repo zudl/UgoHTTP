@@ -1,0 +1,6 @@
+{
+  "name": "UgoHttp",
+  "rootNamespace": "UgoHttp",
+  "allowUnsafeCode": true,
+  "noEngineReferences": true
+}

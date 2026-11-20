@@ -1,0 +1,6 @@
+{
+  "name": "UgoHttp.Player",
+  "references": ["UgoHttp"],
+  "includePlatforms": ["Android", "iOS"],
+  "allowUnsafeCode": true
+}

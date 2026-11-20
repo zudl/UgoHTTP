@@ -1,0 +1,7 @@
+{
+  "name": "UgoHttp.EditMode.Tests",
+  "references": ["UgoHttp", "UgoHttp.Editor", "UgoHttp.TestBehaviours"],
+  "includePlatforms": ["Editor"],
+  "optionalUnityReferences": ["TestAssemblies"],
+  "allowUnsafeCode": true
+}

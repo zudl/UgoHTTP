@@ -1,0 +1,8 @@
+# Sourced by the container scripts: the image runs the host's own architecture, never an emulated one
+# (sanitizers and network faults fail under QEMU user emulation).
+case $(uname -m) in
+arm64 | aarch64) platform=linux/arm64 base_pin=LINUX_SMOKE_IMAGE lock=packages.lock ;;
+*) platform=linux/amd64 base_pin=LINUX_X86_64_SMOKE_IMAGE lock=packages-amd64.lock ;;
+esac
+# Docker on Windows needs C:/... paths, and Git Bash must not rewrite /work-style arguments.
+host_path() { (cd "$1" && { pwd -W 2>/dev/null || pwd; }); }

@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+work=$(mktemp -d "${TMPDIR:-/tmp}/ugo-layout.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+eval "set -- ${CC:-cc}"
+"$@" -std=c11 -pedantic -Wall -Wextra -Werror -DUGO_LAYOUT_PRINT -I "$root/native/include" \
+    "$root/native/abi/layout_check.c" -o "$work/layout-check"
+"$work/layout-check"

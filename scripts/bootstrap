@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+fail() {
+    printf '{"status":"error","tools":{},"problems":["%s"]}\n' "$1"
+    exit 1
+}
+case $(uname -s) in
+MINGW* | MSYS* | CYGWIN*)
+    url=$(sed -n 's/^WINDOWS_HOST_PYTHON_URL=//p' "$root/scripts/versions.env")
+    sha=$(sed -n 's/^WINDOWS_HOST_PYTHON_SHA256=//p' "$root/scripts/versions.env")
+    tools="$HOME/.cache/ugohttp/tools"
+    if [ ! -d "$tools/$sha" ]; then
+        mkdir -p "$tools"
+        work=$(mktemp -d "$tools/.bootstrap.XXXXXXXX")
+        trap 'rm -rf "$work"' EXIT
+        curl --fail --location --silent --show-error --retry 3 --output "$work/python.tar.gz" "$url" >&2 ||
+            fail "Python download failed: $url"
+        [ "$(sha256sum "$work/python.tar.gz" | cut -d ' ' -f 1)" = "$sha" ] || fail "Python: downloaded SHA256 mismatch"
+        mkdir "$work/tree"
+        tar -xzf "$work/python.tar.gz" -C "$work/tree" || fail "Python: extraction failed"
+        mv "$work/tree" "$tools/$sha" 2>/dev/null || [ -d "$tools/$sha" ] || fail "Python: cannot publish $tools/$sha"
+    fi
+    exec "$root/scripts/python" "$root/native/deps/driver.py" bootstrap "$@"
+    ;;
+esac
+command -v brew >/dev/null 2>&1 || fail "Homebrew is required: https://brew.sh"
+export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_BUNDLE_NO_UPGRADE=1
+brew bundle --file "$root/Brewfile" >&2 || fail "brew bundle failed"
+export JAVA_HOME="$(brew --prefix openjdk@21)/libexec/openjdk.jdk/Contents/Home"
+export PATH="$JAVA_HOME/bin:$(brew --prefix)/bin:$PATH"
+exec python3 "$root/native/deps/driver.py" bootstrap "$@"

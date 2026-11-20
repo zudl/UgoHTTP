@@ -1,0 +1,12 @@
+.DS_Store
+/out/
+/tmp/
+.venv/
+__pycache__/
+*.pyc
+/package/Plugins/
+/package/Plugins.meta
+/tests/dotnet/bin/
+/tests/dotnet/obj/
+.idea/
+*.iml

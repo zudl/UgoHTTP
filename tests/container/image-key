@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")"
+. ./platform
+if command -v shasum >/dev/null 2>&1; then sha256() { shasum -a 256 "$@"; }; else sha256() { sha256sum "$@"; }; fi
+{
+    sha256 Dockerfile fault selftest.py "$lock"
+    sed -n "/^$base_pin=/p" ../../scripts/versions.env
+    printf 'platform=%s\n' "$platform"
+} | sha256 | cut -d ' ' -f 1

@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import difflib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from player_common import PINS, ROOT, Failed, Lines, Unavailable, check_posts, log, run, start_bench, stop_process
+
+DEVICE = 'ugohttp_player'
+BUNDLE = 'com.ugohttp.player'
+# Any app that takes the foreground sends the player to the background.
+FOREGROUND_THIEF = 'com.apple.Preferences'
+BOOT_TIMEOUT_S = 300
+RESULT_TIMEOUT_S = 180
+# iOS grants about 30 s of background time; the margin covers a slow simulator.
+EXPIRY_TIMEOUT_S = 240
+# runningboardd warns an app 5 s before it expires the app's background assertions; UIKit runs the expiration handlers
+# only once that warning has reached the app. On an overloaded host the simulator's runningboardd can deliver it after
+# the expiry or not at all, and then kills the app for an assertion it never got the chance to give up. Such an attempt
+# proves nothing about the library and is run again; any other early end of the player still fails.
+WARNING_LEAD_MIN_S = 1.0
+ATTEMPTS = 3
+# The soak prints a progress line every minute; a longer silence means the app or its console is gone.
+SOAK_SILENCE_S = 180
+SOAK_MARGIN_S = 300
+
+
+def simctl(*args, **kwargs):
+    return run(['xcrun', 'simctl', *args], **kwargs)
+
+
+def device():
+    """UDID and state of this runner's own simulator; created on first use, never any other device."""
+    try:
+        listing = json.loads(simctl('list', 'devices', '--json'))
+        runtimes = json.loads(simctl('list', 'runtimes', '--json'))['runtimes']
+    except (Failed, OSError, ValueError, subprocess.SubprocessError) as error:
+        raise Unavailable(f'simctl unavailable: {error}') from error
+    if not any(r['identifier'] == PINS['IOS_SIM_RUNTIME'] and r.get('isAvailable') for r in runtimes):
+        raise Unavailable(f'simulator runtime {PINS["IOS_SIM_RUNTIME"]} is not installed (Xcode > Settings > Components)')
+    own = [d for d in listing['devices'].get(PINS['IOS_SIM_RUNTIME'], []) if d['name'] == DEVICE]
+    if len(own) > 1:
+        raise Unavailable(f'several simulators named {DEVICE}; delete the extra ones')
+    if own:
+        return own[0]['udid'], own[0]['state']
+    try:
+        udid = simctl('create', DEVICE, PINS['IOS_SIM_DEVICE_TYPE'], PINS['IOS_SIM_RUNTIME']).strip().splitlines()[-1]
+    except (Failed, subprocess.SubprocessError) as error:
+        raise Unavailable(f'simctl create failed: {error}') from error
+    return udid, 'Shutdown'
+
+
+def boot(udid):
+    try:
+        simctl('boot', udid)
+    except (Failed, OSError, subprocess.SubprocessError) as error:
+        raise Unavailable(f'{DEVICE} boot failed: {error}') from error
+
+
+def wait_booted(udid, started):
+    try:
+        simctl('bootstatus', udid, timeout=BOOT_TIMEOUT_S)
+    except subprocess.TimeoutExpired as error:
+        raise Unavailable(f'{DEVICE} did not boot in {BOOT_TIMEOUT_S}s') from error
+    except (Failed, OSError, subprocess.SubprocessError) as error:
+        raise Unavailable(f'{DEVICE} boot failed: {error}') from error
+    seconds = round(time.monotonic() - started, 1)
+    log(f'{DEVICE} ready in {seconds}s')
+    return seconds
+
+
+def read_player(console_path, command, environment, to_background, to_foreground):
+    """Launches the player attached to its console and drives the background phase from its log lines."""
+    console = console_path.open('w')
+    log('$ ' + shlex.join(command))
+    player = subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+    background = {}
+    try:
+        lines = Lines(player.stdout)
+        layout, ended, error = [], False, None
+        deadline = time.monotonic() + RESULT_TIMEOUT_S
+        backgrounded = foregrounded = None
+        while time.monotonic() < deadline:
+            for line in lines.read(1):
+                console.write(line + '\n')
+                if line.startswith('error: '):
+                    error = line
+                marker = line.find('UGO-')
+                text = line[marker:] if marker >= 0 else ''
+                if text == 'UGO-LAYOUT-END':
+                    ended = True
+                elif text.startswith('UGO-LAYOUT ') and not ended:
+                    layout.append(text[len('UGO-LAYOUT '):])
+                elif text == 'UGO-BACKGROUND-READY':
+                    to_background()
+                    backgrounded = time.monotonic()
+                    deadline = backgrounded + EXPIRY_TIMEOUT_S
+                elif text.startswith('UGO-BACKGROUND-FINISHED '):
+                    background['finish_seconds'] = round(time.monotonic() - backgrounded, 1)
+                    background['finished_while_backgrounded'] = foregrounded is None
+                elif text.startswith('UGO-BACKGROUND-EXPIRED '):
+                    background['expired_seconds'] = round(time.monotonic() - backgrounded, 1)
+                    background['expired_while_backgrounded'] = foregrounded is None
+                    if foregrounded is None:
+                        foregrounded = time.monotonic()
+                        to_foreground()
+                    deadline = time.monotonic() + RESULT_TIMEOUT_S
+                elif text.startswith('UGO-RESULT '):
+                    background['interval_monotonic_seconds'] = (backgrounded, foregrounded or time.monotonic())
+                    return layout, ended, json.loads(text[len('UGO-RESULT '):]), background
+            if lines.closed:
+                raise Failed(f'the player console ended before the result ({error or "no error line"}); see {console.name}')
+            # A process suspended after expiry may only log once it is in front again.
+            if backgrounded and foregrounded is None and time.monotonic() >= deadline:
+                foregrounded = time.monotonic()
+                background['foregrounded_after_seconds'] = round(foregrounded - backgrounded, 1)
+                to_foreground()
+                deadline = foregrounded + RESULT_TIMEOUT_S
+        raise Failed(f'no UGO-RESULT in time; see {console.name}')
+    finally:
+        stop_process(player, timeout=10)
+        console.close()
+
+
+def read_soak(work, command, environment, seconds):
+    """Launches the player in soak mode and collects its minute lines until the result."""
+    console = (work / 'console.txt').open('w')
+    log('$ ' + shlex.join(command))
+    player = subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+    progress = []
+    try:
+        lines = Lines(player.stdout)
+        error = None
+        deadline = time.monotonic() + seconds + SOAK_MARGIN_S
+        heard = time.monotonic()
+        while time.monotonic() < deadline:
+            for line in lines.read(1):
+                console.write(line + '\n')
+                console.flush()
+                if line.startswith('error: '):
+                    error = line
+                marker = line.find('UGO-')
+                text = line[marker:] if marker >= 0 else ''
+                if text.startswith('UGO-SOAK '):
+                    heard = time.monotonic()
+                    progress.append(json.loads(text[len('UGO-SOAK '):]))
+                    log(text)
+                elif text.startswith('UGO-RESULT '):
+                    return json.loads(text[len('UGO-RESULT '):]), progress
+            if lines.closed:
+                raise Failed(f'the player console ended before the result ({error or "no error line"}); see {console.name}')
+            if time.monotonic() - heard > SOAK_SILENCE_S + (60 if not progress else 0):
+                raise Failed(f'no soak progress for {SOAK_SILENCE_S}s; see {console.name}')
+        raise Failed(f'no UGO-RESULT in time; see {console.name}')
+    finally:
+        stop_process(player, timeout=10)
+        console.close()
+
+
+def soak_of(result, progress, ready):
+    """Player verdict, the bench's own view of each socket, and the memory trend from the minute lines."""
+    # The bench logs a socket once its close reply is out, which may be just after the player's result line.
+    deadline = time.monotonic() + 10
+    while True:
+        records = [json.loads(line) for line in (Path(ready['ca_pem']).parent / 'requests.jsonl').read_text().splitlines()]
+        bench = [r['ws_soak'] for r in records if 'ws_soak' in r]
+        if len(bench) >= 2 or time.monotonic() > deadline:
+            break
+        time.sleep(0.2)
+    problems = [result['problems']] if result.get('problems') else []
+    sockets = (result.get('soak') or {}).get('sockets', [])
+    if len(bench) != 2:
+        problems.append(f'bench saw {len(bench)} soak sockets, expected 2')
+    for side in bench:
+        if side['problem'] or side['dropped'] or side['client_close'] != 1000:
+            problems.append(f'bench: {side}')
+        if side['pings'] - side['pongs'] > 1:
+            problems.append(f'bench: {side["pings"]} pings, {side["pongs"]} pongs')
+    if sorted(s['echoed'] for s in bench) != sorted(s['sent'] for s in sockets):
+        problems.append('bench echoes differ from the player\'s sent counts')
+    trend = {}
+    for name in ('resident_bytes', 'footprint_bytes', 'heap_bytes', 'gc_count'):
+        values = [p[name] for p in progress]
+        if values:
+            trend[name] = {'first': values[0], 'last': values[-1], 'max': max(values), 'min': min(values)}
+    passed = result.get('all_passed') is True and not problems and bool(progress)
+    return passed, {'player': result.get('soak'), 'bench': bench, 'trend': trend, 'minutes': len(progress),
+                    **({'problems': problems} if problems else {})}
+
+
+def lan_address():
+    interface = next((line.split()[-1] for line in run(['route', '-n', 'get', 'default']).splitlines()
+                      if line.strip().startswith('interface:')), None)
+    if not interface:
+        raise Unavailable('no default route; pass --bench-host')
+    return run(['ipconfig', 'getifaddr', interface]).strip()
+
+
+def build_device_app(work, team, keychain):
+    """IL2CPP player for iphoneos, signed by automatic provisioning of the given team."""
+    version = (ROOT / 'tests/player/ProjectSettings/ProjectVersion.txt').read_text().split()[1]
+    editor = Path('/Applications/Unity/Hub/Editor') / version / 'Unity.app/Contents/MacOS/Unity'
+    if not editor.is_file():
+        raise Unavailable(f'Unity {version} is not installed')
+    xcode, derived = work / 'xcode', work / 'derived'
+    run([editor, '-batchmode', '-nographics', '-projectPath', ROOT / 'tests/player', '-buildTarget', 'iOS',
+         '-executeMethod', 'IosPlayerBuild.Build', '-ugoXcode', xcode, '-ugoDevice', '-logFile', work / 'unity-build.log'],
+        timeout=1800)
+    output = run(['xcodebuild', '-project', xcode / 'Unity-iPhone.xcodeproj', '-scheme', 'Unity-iPhone',
+                  '-configuration', 'Release', '-sdk', 'iphoneos', '-derivedDataPath', derived,
+                  '-allowProvisioningUpdates', f'DEVELOPMENT_TEAM={team}', 'CODE_SIGN_STYLE=Automatic',
+                  *([f'OTHER_CODE_SIGN_FLAGS=--keychain {keychain}'] if keychain else []), 'build'],
+                 check=False, timeout=1800)
+    apps = sorted((derived / 'Build/Products/Release-iphoneos').glob('*.app'))
+    if len(apps) != 1:
+        signing = [line for line in output.splitlines() if 'error:' in line]
+        raise Unavailable('device app build failed: ' + ('; '.join(dict.fromkeys(signing)) or 'see the log'))
+    return apps[0]
+
+
+def checks_of(result, ready, background, layout, ended, native, work):
+    diff = list(difflib.unified_diff(native, layout, 'native.dump', 'il2cpp.dump', lineterm=''))
+    (work / 'layout.diff').write_text('\n'.join(diff) + '\n' if diff else '')
+    checks = result.get('checks', {})
+    check_posts(checks, ready, background.pop('interval_monotonic_seconds'))
+    checks['background_finish_while_backgrounded'] = (
+        'pass' if background.get('finished_while_backgrounded') else 'fail: the transfer did not end while in the background')
+    if 'fatal' in checks:
+        checks['fatal'] = 'fail: ' + checks['fatal']
+    for name in ('detached_post', 'background_detached_post', 'background_finish', 'background_expired',
+                 'websocket_listener', 'websocket_awaitable_wss'):
+        checks.setdefault(name, 'fail: no result')
+    passed = (result.get('all_passed') is True and ended and not diff
+              and all(value == 'pass' for value in checks.values()))
+    return passed, checks, {'layout_lines': len(layout), 'layout_diff_lines': len(diff)}
+
+
+def bench_config(ready, **extra):
+    return {**{name: ready['endpoints'][name] for name in ('http', 'https', 'self_signed')},
+            'ca_pem': Path(ready['ca_pem']).read_text(), **extra}
+
+
+def watch_runningboard(udid, path):
+    """Streams runningboardd's lines about the player, and the player's receipt of expiry warnings, into path;
+    returns once the stream is live."""
+    predicate = (f'eventMessage CONTAINS "{BUNDLE}" AND '
+                 '(process == "runningboardd" OR eventMessage CONTAINS "async_willExpireAssertionsSoon")')
+    with path.open('wb') as out:
+        stream = subprocess.Popen(['xcrun', 'simctl', 'spawn', udid, 'log', 'stream', '--style', 'compact', '--level',
+                                   'debug', '--predicate', predicate],
+                                  stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
+    deadline = time.monotonic() + 60
+    while b'Filtering the log data' not in path.read_bytes():
+        if stream.poll() is not None or time.monotonic() > deadline:
+            stop_process(stream, timeout=5)
+            raise Unavailable(f'runningboardd log stream did not start; see {path}')
+        time.sleep(0.1)
+    return stream
+
+
+def expiry_warning_lead(path, offset):
+    """Seconds between the player receiving runningboardd's expiry warning and the expiry of the assertion
+    runningboardd then killed it for (0 if the warning reached it only after the expiry, or never); None unless the
+    player was killed that way. Reads the stream from byte offset on."""
+    deadline = time.monotonic() + 15
+    while b'code:0x2182BAD2' not in (text := path.read_bytes()[offset:]) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    text = text.decode(errors='replace')
+    killed = re.search(r'code:0x2182BAD2 explanation:Timed-out waiting for process \[app<[^>]*>:\d+\] to invalidate '
+                       r'assertion with identifier (\S+)', text)
+    if not killed:
+        return None
+    warned = expired = None
+    received = []
+    for line in text.splitlines():
+        if not line[:4].isdigit():
+            continue
+        at = datetime.strptime(line[:23], '%Y-%m-%d %H:%M:%S.%f').timestamp()
+        if 'async_willExpireAssertionsSoon' in line:
+            received.append(at)
+        elif f'Assertion warning event: {killed[1]} ' in line:
+            warned = at
+        elif f'Assertion did invalidate due to timeout: {killed[1]} ' in line:
+            expired = at
+    if warned is None or expired is None:
+        return None
+    return round(expired - min((at for at in received if warned <= at <= expired), default=expired), 3)
+
+
+def run_simulator(options, summary, cleanup):
+    udid, state = device()
+    if state != 'Shutdown':
+        raise Unavailable(f'{DEVICE} ({udid}) is {state}: another run owns it')
+    summary['udid'] = udid
+    boot_started = time.monotonic()
+    boot(udid)
+    cleanup.append(lambda: simctl('shutdown', udid))
+    summary['boot_seconds'] = wait_booted(udid, boot_started)
+    cleanup.append(lambda: simctl('terminate', udid, BUNDLE, check=False))
+    simctl('install', udid, options.app, timeout=300)
+    command = ['xcrun', 'simctl', 'launch', '--console-pty', '--terminate-running-process', udid, BUNDLE]
+    if options.soak:
+        bench, ready = start_bench()
+        cleanup.append(lambda: stop_process(bench))
+        environment = os.environ.copy()
+        environment['SIMCTL_CHILD_UGO'] = base64.b64encode(json.dumps(bench_config(ready, soak=options.soak)).encode()).decode()
+        return ready, read_soak(options.work, command, environment, options.soak)
+    runningboard = options.work / 'runningboard.txt'
+    stream = watch_runningboard(udid, runningboard)
+    cleanup.append(lambda: stop_process(stream, timeout=5))
+    late = summary['late_expiry_warnings'] = []
+    for attempt in range(1, ATTEMPTS + 1):
+        # A fresh bench per attempt: the runner checks every POST of the attempt it accepts, never an earlier one's.
+        bench, ready = start_bench()
+        cleanup.append(lambda bench=bench: stop_process(bench))
+        offset = runningboard.stat().st_size
+        environment = os.environ.copy()
+        environment['SIMCTL_CHILD_UGO'] = base64.b64encode(json.dumps(bench_config(ready)).encode()).decode()
+        try:
+            result = read_player(options.work / f'console-{attempt}.txt', command, environment,
+                                 lambda: simctl('launch', udid, FOREGROUND_THIEF), lambda: simctl('launch', udid, BUNDLE))
+        except Failed:
+            stop_process(bench)
+            lead = expiry_warning_lead(runningboard, offset)
+            if lead is None or lead >= WARNING_LEAD_MIN_S:
+                raise
+            if attempt == ATTEMPTS:
+                raise Unavailable(f'the expiry warning came too late in all {ATTEMPTS} attempts '
+                                  f'({[entry["warning_lead_seconds"] for entry in late] + [lead]} s); the host is overloaded')
+            late.append({'attempt': attempt, 'warning_lead_seconds': lead})
+            log(f'attempt {attempt}: the player got the expiry warning {lead}s before the expiry it was killed for; again')
+            continue
+        return ready, result
+
+
+def run_device(options, summary, cleanup):
+    """A USB device: ios-deploy installs, launches under lldb with the config in the environment and relays the console.
+    The player sends itself to the background; bringing it back after the expiry needs a person to tap its icon."""
+    if not shutil.which('ios-deploy'):
+        raise Unavailable('ios-deploy missing (brew install ios-deploy)')
+    summary['udid'] = options.device
+    host = options.bench_host or lan_address()
+    summary['bench_host'] = host
+    bench, ready = start_bench('--host', host)
+    cleanup.append(lambda: stop_process(bench))
+    base = ['ios-deploy', '--id', options.device, '--no-wifi', '--bundle', options.app]
+    run([*base, '--timeout', '10'], timeout=600)
+    encoded = base64.b64encode(json.dumps(bench_config(ready, open_settings=True, soak=options.soak)).encode()).decode()
+    command = [str(arg) for arg in (*base, '--noinstall', '--noninteractive', '--envs', 'UGO=' + encoded)]
+    # ios-deploy relays the app's output from lldb's embedded Python, which block-buffers into a pipe until exit;
+    # a pseudo-terminal from script(1) makes it line-buffered.
+    command = ['script', '-q', '/dev/null', *command]
+    if options.soak:
+        return ready, read_soak(options.work, command, os.environ.copy(), options.soak)
+    return ready, read_player(options.work / 'console.txt', command, os.environ.copy(), lambda: None,
+                              lambda: log('UGO: bring the player to the front on the device by tapping its icon'))
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Runs the IL2CPP player checks on an iOS simulator of its own '
+                                                 'or, with --device, on a USB device.')
+    parser.add_argument('--app', type=Path, help='built .app; with --device it may be omitted when --team is given')
+    parser.add_argument('--work', required=True, type=Path)
+    parser.add_argument('--device', metavar='UDID', help='run on this USB device instead of the simulator')
+    parser.add_argument('--team', help='with --device and no --app: build and sign the player for this team')
+    parser.add_argument('--keychain', type=Path, help='with --team: sign with the identity from this unlocked keychain')
+    parser.add_argument('--bench-host', help='with --device: bench address the device reaches (default: this Mac on '
+                                             'the default route)')
+    parser.add_argument('--soak', type=int, default=0, metavar='SECONDS',
+                        help='instead of the checks: WebSocket soak of this many seconds (4 h: 14400)')
+    options = parser.parse_args()
+    if not options.app and not (options.device and options.team):
+        parser.error('--app is required unless --device and --team are given')
+    options.work = options.work.resolve()
+    options.work.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    summary = {'status': 'error'}
+    cleanup = []
+    try:
+        if not (ROOT / 'tests/bench/.venv/bin/python').is_file():
+            raise Unavailable('bench venv missing; run ./scripts/bootstrap')
+        if not options.app:
+            options.app = build_device_app(options.work, options.team, options.keychain)
+        if not (options.app / 'Info.plist').is_file():
+            raise Unavailable(f'{options.app} is not an app bundle')
+        summary['app_bytes'] = sum(p.stat().st_size for p in options.app.rglob('*') if p.is_file())
+        native = subprocess.run([str(ROOT / 'native/abi/dump')], check=True, text=True,
+                                stdout=subprocess.PIPE).stdout.splitlines()
+        ready, outcome = (run_device if options.device else run_simulator)(options, summary, cleanup)
+        if options.soak:
+            passed, soak = soak_of(*outcome, ready)
+            summary.update(status='pass' if passed else 'fail', soak=soak)
+        else:
+            layout, ended, result, background = outcome
+            passed, checks, layout_summary = checks_of(result, ready, background, layout, ended, native, options.work)
+            summary.update(status='pass' if passed else 'fail', checks=checks, background=background, **layout_summary)
+    except Unavailable as error:
+        summary.update(status='error', problems=[str(error)])
+    except (Failed, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        summary.update(status='fail', problems=[str(error)])
+    finally:
+        problems = []
+        for action in reversed(cleanup):
+            try:
+                action()
+            except (Failed, OSError, subprocess.SubprocessError) as error:
+                problems.append(str(error))
+        if problems:
+            summary.update(status='fail', problems=summary.get('problems', []) + problems)
+    summary['seconds'] = round(time.monotonic() - started, 1)
+    print(json.dumps(summary, separators=(',', ':')), flush=True)
+    return {'pass': 0, 'fail': 1}.get(summary['status'], 2)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Builds the native tests with a sanitizer, starts the fault bench, runs them; one JSON line, exit code."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import selectors
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parents[2]
+LINUX_SLICE = 'linux-arm64' if platform.machine() in ('aarch64', 'arm64') else 'linux-x86_64'
+FLAGS = {
+    'asan': '-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g -O1',
+    'tsan': '-fsanitize=thread -g -O1',
+}
+
+
+def log(*args):
+    print(*args, file=sys.stderr, flush=True)
+
+
+def run(args, **kwargs):
+    subprocess.run([str(a) for a in args], cwd=ROOT, check=True, stdout=sys.stderr, stderr=sys.stderr, **kwargs)
+
+
+def pins():
+    return dict(line.split('=', 1) for line in (ROOT / 'scripts/versions.env').read_text().splitlines()
+                if line and not line.startswith('#'))
+
+
+def container_deps(sanitizer):
+    """Dependencies built inside the container; TSan needs them instrumented, ASan does not."""
+    flags = FLAGS['tsan'] if sanitizer == 'tsan' else ''
+    output = ROOT / f'out/{LINUX_SLICE}-native-{sanitizer}/deps-prefix'
+    p = pins()
+    inputs = {k: v for k, v in p.items() if k.split('_')[0] in ('CURL', 'MBEDTLS', 'NGHTTP2', 'ZLIB')}
+    inputs['flags'] = flags
+    for name in ('CMakeLists.txt', 'client_config.h', 'client_config.cmake'):
+        inputs[name] = (ROOT / 'native/deps' / name).read_text()
+    for patch in sorted((ROOT / 'native/deps/patches').glob('*.patch')):
+        inputs['patches/' + patch.name] = patch.read_text()
+    signature = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+    marker = output / 'inputs.sha256'
+    if marker.is_file() and marker.read_text().strip() == signature:
+        return output
+    if output.exists():
+        shutil.rmtree(output)
+    output.mkdir(parents=True)
+    entries = []
+    for name in ('CURL', 'MBEDTLS', 'NGHTTP2', 'ZLIB'):
+        archive = Path('/sources') / (p[name + '_SHA256'] + '-' + p[name + '_URL'].rsplit('/', 1)[1])
+        entries += [f'set({name}_ARCHIVE "{archive}")', f'set({name}_SHA256 "{p[name + "_SHA256"]}")']
+    (output / 'pins.cmake').write_text('\n'.join(entries) + '\n')
+    (output / 'toolchain.cmake').write_text('set(CMAKE_C_COMPILER clang)\nset(CMAKE_CXX_COMPILER clang++)\n')
+    run(['cmake', '-S', ROOT / 'native/deps', '-B', output / 'build', '-G', 'Ninja',
+         '-DUGO_PINS=' + str(output / 'pins.cmake'), '-DUGO_OUTPUT=' + str(output),
+         '-DUGO_TOOLCHAIN=' + str(output / 'toolchain.cmake'),
+         '-DUGO_SANITIZER_FLAGS=' + flags])
+    run(['cmake', '--build', output / 'build', '--parallel', '2'])
+    marker.write_text(signature + '\n')
+    return output
+
+
+def start_bench(command, log_path):
+    bench = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=log_path.open('w'), text=True)
+    with selectors.DefaultSelector() as selector:
+        selector.register(bench.stdout, selectors.EVENT_READ)
+        started = time.monotonic()
+        if not selector.select(timeout=60):
+            bench.kill()
+            raise RuntimeError('bench did not publish readiness in 60 s')
+        ready = json.loads(bench.stdout.readline())
+    log(f'bench ready in {time.monotonic() - started:.1f}s')
+    return bench, ready
+
+
+def stop(process):
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--sanitizer', choices=sorted(FLAGS), required=True)
+    parser.add_argument('--test')
+    args = parser.parse_args()
+    started = time.monotonic()
+    linux = platform.system() == 'Linux'
+    environment = (LINUX_SLICE + '-container' if linux else 'macos-arm64') + '-' + args.sanitizer
+    result = {'environment': environment, 'sanitizer': args.sanitizer, 'tests': [], 'binaries': {}}
+    problems = []
+    bench = None
+    try:
+        if linux:
+            deps = container_deps(args.sanitizer)
+            compiler = 'clang'
+        else:
+            deps = ROOT / 'out/macos-arm64'
+            compiler = '/usr/bin/clang'
+            if not (deps / 'lib/libcurl.a').is_file():
+                raise RuntimeError('run ./scripts/build macos-arm64 first')
+        build = ROOT / 'out' / f'{LINUX_SLICE if linux else "macos-arm64"}-native-{args.sanitizer}' / 'tests'
+        build.mkdir(parents=True, exist_ok=True)
+        p = pins()
+        sources = Path('/sources') if linux else Path.home() / '.cache/ugohttp/src'
+        pem = (sources / (p['CA_SHA256'] + '-' + p['CA_URL'].rsplit('/', 1)[1])).read_text()
+        header = 'static const char ugo_ca_bundle[] =\n' + ''.join(json.dumps(line + '\n') + '\n' for line in pem.splitlines()) + ';\n'
+        if not (build / 'ca_bundle.h').is_file() or (build / 'ca_bundle.h').read_text() != header:
+            (build / 'ca_bundle.h').write_text(header)
+        flags = FLAGS[args.sanitizer]
+        run(['cmake', '-S', ROOT / 'native', '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Debug',
+             '-DCMAKE_C_COMPILER=' + compiler, '-DUGO_SHARED=OFF', '-DUGO_TESTS=ON',
+             '-DUGO_DEPS=' + str(deps), '-DUGO_CA_HEADER_DIR=' + str(build),
+             '-DCMAKE_C_FLAGS=' + flags, '-DCMAKE_EXE_LINKER_FLAGS=' + flags])
+        run(['cmake', '--build', build, '--parallel', '6'])
+        bench_command = ['python3', str(ROOT / 'tests/container/native_bench.py')] if linux else [str(ROOT / 'scripts/bench')]
+        bench, ready = start_bench(bench_command, build / 'bench.stderr')
+        env = os.environ.copy()
+        leaks = 1 if linux else 0
+        env['ASAN_OPTIONS'] = f'detect_leaks={leaks}:abort_on_error=0:halt_on_error=1:strict_string_checks=1'
+        env['UBSAN_OPTIONS'] = 'halt_on_error=1:print_stacktrace=1'
+        env['TSAN_OPTIONS'] = 'halt_on_error=1:second_deadlock_stack=1'
+        env['UGO_TEST_HTTPS1'] = ready['endpoints']['https1']
+        env['UGO_TEST_TLS12'] = ready['endpoints']['tls12']
+        if linux:
+            env['UGO_TEST_DNS'] = '1'
+            if shutil.which('fault'):
+                env['UGO_TEST_FAULT'] = '1'
+            if Path('/fault-disk').is_dir():
+                env['UGO_TEST_FULL_DISK'] = '/fault-disk'
+            for name in ('ASAN_OPTIONS', 'UBSAN_OPTIONS', 'TSAN_OPTIONS'):
+                env[name] += ':allow_addr2line=1:external_symbolizer_path=/usr/bin/addr2line'
+        for binary in ('ugo-tests', 'ugo-tests-wrap'):
+            tmp = Path(tempfile.mkdtemp(prefix='run-', dir=build))
+            command = [str(build / binary), ready['endpoints']['http'], ready['endpoints']['https'],
+                       ready['ca_pem'], str(tmp)] + ([args.test] if args.test else [])
+            proc = subprocess.run(command, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True, timeout=900)
+            lines = [json.loads(line) for line in proc.stdout.splitlines() if line.startswith('{')]
+            result['tests'] += lines
+            result['binaries'][binary] = proc.returncode
+            if proc.returncode:
+                failed = [t['test'] for t in lines if not t['pass']]
+                problems.append(f'{binary} exited {proc.returncode}; failed: {failed}')
+                if proc.stderr.strip():
+                    result.setdefault('stderr', {})[binary] = proc.stderr[-6000:]
+            elif proc.stderr.strip():
+                result.setdefault('stderr', {})[binary] = proc.stderr[-2000:]
+            shutil.rmtree(tmp, ignore_errors=True)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        problems.append(str(error))
+    finally:
+        if bench:
+            stop(bench)
+    result['passed'] = sum(1 for t in result['tests'] if t['pass'] and 'skipped' not in t)
+    result['skipped'] = {t['test']: t['skipped'] for t in result['tests'] if 'skipped' in t}
+    result['failed'] = [t['test'] for t in result['tests'] if not t['pass']]
+    result.update(status='error' if problems else 'ok', problems=problems,
+                  seconds=round(time.monotonic() - started, 1))
+    print(json.dumps(result, separators=(',', ':')), flush=True)
+    return 1 if problems else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

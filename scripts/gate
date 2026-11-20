@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if ! "$root/scripts/python" -c '' >/dev/null 2>&1; then
+    printf '%s\n' '{"status":"error","steps":{},"seconds":0.0}'
+    exit 2
+fi
+exec "$root/scripts/python" "$root/scripts/gate.py" "$@"

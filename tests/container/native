@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+root=$(CDPATH= cd -- "$here/../.." && pwd)
+. "$here/platform"
+"$here/bootstrap" >&2
+key=$("$here/image-key")
+# Without ASLR: the image's TSan (clang 14) aborts on the mappings a kernel with vm.mmap_rnd_bits 32 (WSL2) gives.
+MSYS_NO_PATHCONV=1 exec docker run --rm --init --platform "$platform" --cap-add NET_ADMIN --network none --security-opt seccomp=unconfined \
+    --tmpfs /fault-disk:rw,size=1m,mode=1777 \
+    --mount "type=bind,source=$(host_path "$root"),target=/work" \
+    --mount "type=bind,source=$(host_path "$HOME/.cache/ugohttp/src"),target=/sources,readonly" \
+    "$(cat "$root/out/container/$key.iid")" setarch -R python3 /work/native/tests/run "$@"

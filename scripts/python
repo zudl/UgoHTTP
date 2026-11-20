@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+case $(uname -s) in
+MINGW* | MSYS* | CYGWIN*)
+    root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+    sha=$(sed -n 's/^WINDOWS_HOST_PYTHON_SHA256=//p' "$root/scripts/versions.env")
+    python="$HOME/.cache/ugohttp/tools/$sha/python/python.exe"
+    if [ ! -x "$python" ]; then
+        printf '%s\n' '{"status":"error","problems":["pinned Python missing; run ./scripts/bootstrap"]}'
+        exit 2
+    fi
+    # Windows Python otherwise decodes files and pipes with the ANSI code page.
+    PYTHONUTF8=1 exec "$python" "$@"
+    ;;
+esac
+exec python3 "$@"
