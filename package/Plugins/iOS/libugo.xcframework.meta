@@ -1,0 +1,31 @@
+fileFormatVersion: 2
+guid: 8b6dbc885e794d1182dc69a2f844c788
+folderAsset: yes
+PluginImporter:
+  externalObjects: {}
+  serializedVersion: 3
+  iconMap: {}
+  executionOrder: {}
+  defineConstraints: []
+  isPreloaded: 0
+  isOverridable: 1
+  isExplicitlyReferenced: 0
+  validateReferences: 1
+  platformData:
+    Any:
+      enabled: 0
+      settings: {}
+    Editor:
+      enabled: 0
+      settings:
+        DefaultValueInitialized: true
+    iOS:
+      enabled: 1
+      settings:
+        AddToEmbeddedBinaries: false
+        CPU: AnyCPU
+        CompileFlags: 
+        FrameworkDependencies: CoreFoundation;UIKit;
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
